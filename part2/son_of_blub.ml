@@ -1,12 +1,5 @@
 (*
-  Obviously there were a couple of issues with inputting instructions for
-  the interpreter to run.  First, you were forced to hand code the data
-  structure, and second, you were forced to hand-code the variable bindings
-  by indicating the frame and offset indices to find the value of the
-  variable.  In this installment, we will automatically do the variable
-  lookups and get a tiny bit closer to having a 'nice' input format.
-
-  Before that, however, we will get to the point of all this -- running the
+  Let's get to the point of all this -- running the
   LLVM JIT compiler.  In this installment the compiler will be the
   bare minimum, but the basics will be in place.  We will pass in a function
   to be compiled and get an llvalue back representing the code to be
@@ -16,13 +9,11 @@
 
   <look at code here>
 
-  Also add a simple let-statement that is like this:
-  (let (x y) expr) ==> ((lambda (x) expr) y)
+  (((lambda (y) (lambda (a x) (if a x y))) 47) #t 34) -- even C can't do that!
 
-  ((lambda (a x y) (if a x y)) #t 34 37)
-
-  (((lambda (y) (lambda (a x) (if a x y))) 37) #t 34) -- even C can't do that!
-  (let (y 37) ((lambda (a x) (if a x y)) #t 34))
+  I removed the frame index and offset numbers from Ref; we will just look
+  things up at runtime, which is a worse way to do it.  We will add the other
+  back when we compile the bindings; will do it as a mini-post.
 *)
 
 module EE = Llvm_executionengine.ExecutionEngine
@@ -32,7 +23,7 @@ type variable = Variable of string
 
 type ast =
     Ast_lit of sval
-  | Ast_ref of variable * int * int  (* variable; frame #; offset # *)
+  | Ast_ref of variable 
   | Ast_cnd of ast * ast * ast  (* if part; then part; else part *)
   | Ast_app of ast * ast array
   | Ast_abs of lambda
@@ -41,7 +32,7 @@ and lambda = {
   lam_ast : ast;
   lam_params : variable array;
   lam_lltype : Llvm.lltype option;  (* this is a hack because we don't have a
-				       type system *)
+				       type system of any kind yet *)
 }
 
 and sval =
@@ -57,18 +48,32 @@ and sclosure = {
   close_jitcode : (Llvm.lltype * Llvm.llvalue) Lazy.t  (* return value; code *)
 }
 
-and environment_frame = {
-  env_frame_vars : variable array;  (* mostly for debugging *)
-  env_frame_vals : sval array
+and frame = {
+  frame_vars : variable array;  (* mostly for debugging *)
+  frame_vals : sval array
 }
 
-and environment = environment_frame list
+and environment = frame list
+
+(* BASIC UTILITIES *)
+
+let find_in_env env v : (sval * int * int) =
+  let rec find frame_idx = function
+      [] -> raise Not_found
+    | frame :: env ->
+	try
+	  let offset = ExtArray.Array.findi ((=) v) frame.frame_vars in
+	  (frame.frame_vals.(offset), frame_idx, offset)
+	with Not_found ->
+	  find (frame_idx+1) env
+  in
+  find 0 env
+;;
 
 (* LLVM SECTION *)
 
 exception Jit_failed
 open Llvm
-
 
 let llvm_val_of_int t x = Sllvm (t, GV.of_int t x) ;;
 let make_bool value = llvm_val_of_int Llvm.i1_type (if value then 1 else 0) ;;
@@ -77,22 +82,23 @@ let make_int value = llvm_val_of_int Llvm.i64_type value ;;
 let llvalue_of_gv t v =
   match t with
       i1_type -> const_int t (GV.as_int v)
-    | i64_type -> const_of_int64 t (GV.as_int64 v) true (* WTF *)
+    | i64_type -> const_of_int64 t (GV.as_int64 v) true (* WTF is the bool for? *)
     | _ -> Format.printf "FAIL\n%!"; raise Jit_failed
 ;;
  
-
 let cur_module = Llvm.create_module "helloworld" ;;
 let jit = EE.create (ModuleProvider.create cur_module) ;;
 
-
-
 let compile_fn (env:environment) (lambda:lambda) = 
+  (* add the params to the environment; but the params should be accessed
+     differently from the surrounding frames *)
+  let frame = { frame_vars = lambda.lam_params;
+		frame_vals = Array.map (fun _ -> Sunbound) lambda.lam_params } in
+  let env = frame :: env in
   let fn_type = match lambda.lam_lltype with
       Some t -> t | None -> raise Jit_failed
   in
   let rettype = return_type fn_type in
-  let argtypes = param_types fn_type in
 
   let cur_fn = define_function "lambda" fn_type cur_module in
   let builder = builder_at_end (entry_block cur_fn) in
@@ -102,16 +108,16 @@ let compile_fn (env:environment) (lambda:lambda) =
 	Ast_lit (Sllvm (t, v)) -> 
 	  let lit_val = llvalue_of_gv t v in
 	  (builder, lit_val)
-      | Ast_ref (var, 0, offset) ->
-	  assert (ExtArray.Array.mem var lambda.lam_params);
-	  (builder, param cur_fn offset)
-      | Ast_ref (var, frame, offset) -> 
-	  (* frame 0 is found in the fn params, not in the environment *)
-	  let v = match (List.nth env (frame-1)).env_frame_vals.(offset) with
-	      Sllvm (t, v) -> llvalue_of_gv t v 
-	    | _ -> raise Jit_failed
-	  in
-	  (builder, v)
+      | Ast_lit _ -> raise Jit_failed  (* can't handle other types yet *)
+      | Ast_ref var -> begin
+	  try
+	    match find_in_env env var with
+		_, 0, offset -> (builder, param cur_fn offset)
+	      | Sllvm (t, v), _, _ -> (builder, llvalue_of_gv t v)
+	      | _ -> raise Jit_failed
+	  with Not_found ->
+	    raise Jit_failed
+	end
       | Ast_cnd (pred, cons, alt) ->
 	  let builder, pred_val = gen_llvm builder pred in
 	  let test = build_icmp Icmp.Ne pred_val (const_int i1_type 0) 
@@ -134,6 +140,8 @@ let compile_fn (env:environment) (lambda:lambda) =
 	  let return = build_phi [(v1, cons_block); (v2, alt_block)] 
 	    "phi" join_builder in
 	  (join_builder, return)
+      | Ast_abs _ -> raise Jit_failed  (* coming soon... *)
+      | Ast_app _ -> raise Jit_failed  (* also coming soon? *)
     in
 
     let builder, retval = gen_llvm builder lambda.lam_ast in
@@ -148,7 +156,7 @@ let compile_fn (env:environment) (lambda:lambda) =
 
 let rec eval env = function 
     Ast_lit lit -> lit
-  | Ast_ref (_, frame, offset) -> (List.nth env frame).env_frame_vals.(offset)
+  | Ast_ref var -> let v, _, _ = find_in_env env var in v
   | Ast_cnd (pred, cons, alt) -> begin
       (* we will just treat it as an i1_type because in general we won't
 	 be converting the Llvm values into svals *)
@@ -169,25 +177,28 @@ and apply fn args =
       Sclosure close -> begin
 	try
 	  let rettype, fn = Lazy.force close.close_jitcode in
-	  let args = Array.map (fun (Sllvm (_, v)) -> v) args in
+	  let args = Array.map (function
+				    Sllvm (_, v) -> v
+				  | _ -> raise Jit_failed) args in
 	  let result = EE.run_function fn args jit in
 	  Sllvm (rettype, result)
 	with Jit_failed ->
-	  let frame = { env_frame_vars = close.close_lam.lam_params;
-			env_frame_vals = args } in
+	  let frame = { frame_vars = close.close_lam.lam_params;
+			frame_vals = args } in
 	  let env' = frame :: close.close_env in
 	  eval env' close.close_lam.lam_ast
       end
+    | _ -> assert false  (* no other values we can 'apply' yet *)
 ;;
 
 
 (* TEST SECTION *)
 
 let mkvar name = Variable name ;;
-let lit gv = Ast_lit gv ;;
-let lit_bool x = lit (make_bool x) ;;
-let lit_int x = lit (make_int x) ;;
-let mkref var frame offset = Ast_ref (mkvar var, frame, offset) ;;
+let mklit gv = Ast_lit gv ;;
+let lit_bool x = mklit (make_bool x) ;;
+let lit_int x = mklit (make_int x) ;;
+let mkref var = Ast_ref (mkvar var) ;;
 let mkcnd pred cons alt = Ast_cnd (pred, cons, alt) ;;
 let mkabs params body lltype = 
   Ast_abs { lam_params = Array.of_list (List.map mkvar params);
@@ -195,10 +206,9 @@ let mkabs params body lltype =
 	    lam_lltype = lltype } ;;
 let mkapp fn args = Ast_app (fn, Array.of_list args) ;;
 
-
 let () =
   let lambda = mkabs ["a"; "x"; "y"] 
-    (mkcnd (mkref "a" 0 0) (mkref "x" 0 1) (mkref "y" 0 2))
+    (mkcnd (mkref "a") (mkref "x") (mkref "y"))
     (Some (function_type i64_type [| i1_type; i64_type; i64_type |]))
   in
   let expr = mkapp lambda [lit_bool true; lit_int 34; lit_int 47] in
@@ -211,17 +221,35 @@ let () =
 
 let () =
   let lambda1 = mkabs ["a"; "x"] 
-    (mkcnd (mkref "a" 0 0) (mkref "x" 0 1) (mkref "y" 1 0))
+    (mkcnd (mkref "a") (mkref "x") (mkref "y"))
     (Some (function_type i64_type [| i1_type; i64_type |]))
   in
+  (* this is a function that takes param 'y' and returns a function with
+     2 params, 'a' and 'x' -- this function return 'x' if 'a' is #t,
+     'y' otherwise *)
   let lambda2 = mkabs ["y"] lambda1 None in (* can't type this _yet_ *)
   let expr = mkapp lambda2 [lit_int 47] in
-  let expr = mkapp expr [lit_bool true; lit_int 34] in
   let result = eval [] expr in
+  (* result should be a function that takes 2 params 'a' and 'x' *)
+  let () = match result with
+      Sclosure _ -> ()
+    | _ -> assert false
+  in
 
-  match result with
+  (* invoke this result with 2 args #f and 34, should return 47 *)
+  let expr' = mkapp (mklit result) [lit_bool false; lit_int 34] in
+  let () = match eval [] expr' with
+      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 47)
+    | _ -> assert false
+  in
+
+  (* invoke with 2 args #t and 34, should return 34 *)
+  let expr' = mkapp (mklit result) [lit_bool true; lit_int 34] in
+  let () = match eval [] expr' with
       Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 34)
     | _ -> assert false
+  in
+  ()
 ;;
 
 let () = Llvm.dump_module cur_module ;;
