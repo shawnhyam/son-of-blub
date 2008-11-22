@@ -40,6 +40,13 @@ and sval =
   | Sllvm of Llvm.lltype * GV.t
   | Sunbound
 
+and environment = frame list
+
+and frame = {
+  frame_vars : variable array;  (* mostly for debugging *)
+  frame_vals : sval array
+}
+
 and sclosure = {
   close_env : environment;
   close_lam : lambda;
@@ -48,12 +55,6 @@ and sclosure = {
   close_jitcode : (Llvm.lltype * Llvm.llvalue) Lazy.t  (* return value; code *)
 }
 
-and frame = {
-  frame_vars : variable array;  (* mostly for debugging *)
-  frame_vals : sval array
-}
-
-and environment = frame list
 
 (* BASIC UTILITIES *)
 
