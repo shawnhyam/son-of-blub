@@ -43,7 +43,7 @@ and sval =
 and environment = frame list
 
 and frame = {
-  frame_vars : variable array;  (* mostly for debugging *)
+  frame_vars : variable array;
   frame_vals : sval array
 }
 
@@ -100,7 +100,6 @@ let compile_fn (env:environment) (lambda:lambda) =
       Some t -> t | None -> raise Jit_failed
   in
   let rettype = return_type fn_type in
-
   let cur_fn = define_function "lambda" fn_type cur_module in
   let builder = builder_at_end (entry_block cur_fn) in
 
@@ -148,8 +147,6 @@ let compile_fn (env:environment) (lambda:lambda) =
     let builder, retval = gen_llvm builder lambda.lam_ast in
     ignore (build_ret retval builder);
     (rettype, cur_fn)
-
-  
 ;;
 
 
@@ -221,13 +218,14 @@ let () =
 ;;
 
 let () =
+  (* (lambda (a x) (if a x y)) *)
   let lambda1 = mkabs ["a"; "x"] 
     (mkcnd (mkref "a") (mkref "x") (mkref "y"))
     (Some (function_type i64_type [| i1_type; i64_type |]))
   in
   (* this is a function that takes param 'y' and returns a function with
      2 params, 'a' and 'x' -- this function return 'x' if 'a' is #t,
-     'y' otherwise *)
+     'y' otherwise   (lambda (y) (lambda (a x) (if a x y)))   *)
   let lambda2 = mkabs ["y"] lambda1 None in (* can't type this _yet_ *)
   let expr = mkapp lambda2 [lit_int 47] in
   let result = eval [] expr in
