@@ -101,6 +101,12 @@ let compile_fn (env:environment) (lambda:lambda) =
   in
   let rettype = return_type fn_type in
   let cur_fn = define_function "lambda" fn_type cur_module in
+
+  (* MAJOR MAJOR HACK to get fact function to work *)
+  let global_frame = List.nth env ((List.length env)-1) in
+  if (Array.length global_frame.frame_vals > 4) then
+    global_frame.frame_vals.(4) <- Sprimfn cur_fn;
+
   let builder = builder_at_end (entry_block cur_fn) in
 
   let rec gen_llvm (builder:llbuilder) (ast:ast) : (llbuilder * llvalue) =
@@ -153,6 +159,8 @@ let compile_fn (env:environment) (lambda:lambda) =
 	      Sllvmbuilder buildfn, _, _ -> 
 		Format.printf "OKOK\n%!";
 		buildfn llvals builder
+	    | Sprimfn fn, _, _ ->
+		(builder, build_call fn (Array.of_list llvals) "" builder)
 	    | _ -> raise Jit_failed
 	end
 	  
@@ -310,14 +318,18 @@ let () =
   let lambda = mkabs ["n"] (mkcnd 
 			      (mkapp (mkref "=") [mkref "n"; lit_int 1])
 			      (lit_int 1)
-			      (mkapp (mkref "fact") 
-				 [mkapp (mkref "-") [mkref "n"; lit_int 1]]))
+			      (mkapp (mkref "*") 
+				 [mkref "n";
+				  (mkapp (mkref "fact") 
+				     [mkapp (mkref "-") [mkref "n"; lit_int 1]])]))
     (Some (function_type i64_type [| i64_type |]))
   in
   let expr = mkapp lambda [lit_int 5] in
   let result = eval [globals] expr in
   let () = match result with
-      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 120)
+      Sllvm (t, v) when t = Llvm.i64_type -> 
+	Format.printf "answer: %d\n%!" (GV.as_int v);
+	assert (GV.as_int v = 120)
     | _ -> assert false
   in
   ()
@@ -325,6 +337,7 @@ let () =
 
 
 
-
+(*
 let () = Llvm.dump_module cur_module ;;
+*)
 
