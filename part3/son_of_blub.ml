@@ -1,19 +1,17 @@
 (*
-  Let's get to the point of all this -- running the
-  LLVM JIT compiler.  In this installment the compiler will be the
-  bare minimum, but the basics will be in place.  We will pass in a function
-  to be compiled and get an llvalue back representing the code to be
-  executed, and then we will call that function with some arguments and
-  get a result.  This is the basic core that will slowly but surely build
-  up into something impressive.
+  This installment is oriented around running the fib function
 
-  <look at code here>
+  We have to be able to create a new symbol in the global environment, but
+  we will fudge around that for now.
 
-  (((lambda (y) (lambda (a x) (if a x y))) 47) #t 34) -- even C can't do that!
+  Must have support for integer * + and -
+    (lambda (n) (+ n 1))
 
-  I removed the frame index and offset numbers from Ref; we will just look
-  things up at runtime, which is a worse way to do it.  We will add the other
-  back when we compile the bindings; will do it as a mini-post.
+  Must have support in the JIT compiler for invoking other functions; in
+  this case, it is a recursive invocation.
+    (define fact (lambda (n) (if (= n 0) 1 ( * n (fact (- n 1))))))
+
+  Use the fast calling convention.
 *)
 
 module EE = Llvm_executionengine.ExecutionEngine
@@ -36,8 +34,10 @@ and lambda = {
 }
 
 and sval =
-    Sclosure of sclosure
+    Sclosure of sclosure    (* closure is a fn + env *)
   | Sllvm of Llvm.lltype * GV.t
+  | Sllvmbuilder of (Llvm.llvalue list -> Llvm.llbuilder -> (Llvm.llbuilder * Llvm.llvalue))
+  | Sprimfn of Llvm.llvalue
   | Sunbound
 
 and environment = frame list
@@ -141,6 +141,21 @@ let compile_fn (env:environment) (lambda:lambda) =
 	    "phi" join_builder in
 	  (join_builder, return)
       | Ast_abs _ -> raise Jit_failed  (* coming soon... *)
+      | Ast_app (Ast_ref var, params) -> begin
+	  let builder, llvals = Array.fold_right
+	    (fun param (builder, llvals) ->
+	       let builder', llval = gen_llvm builder param in
+	       builder', llval :: llvals)
+	    params (builder, [])
+	  in
+
+	  match find_in_env env var with
+	      Sllvmbuilder buildfn, _, _ -> 
+		Format.printf "OKOK\n%!";
+		buildfn llvals builder
+	    | _ -> raise Jit_failed
+	end
+	  
       | Ast_app _ -> raise Jit_failed  (* also coming soon? *)
     in
 
@@ -154,7 +169,14 @@ let compile_fn (env:environment) (lambda:lambda) =
 
 let rec eval env = function 
     Ast_lit lit -> lit
-  | Ast_ref var -> let v, _, _ = find_in_env env var in v
+  | Ast_ref var -> begin
+      try
+	let v, _, _ = find_in_env env var in v
+      with Not_found as ex ->
+	let Variable v = var in
+	Format.printf "Variable %s not found\n%!" v;
+	raise ex
+    end
   | Ast_cnd (pred, cons, alt) -> begin
       (* we will just treat it as an i1_type because in general we won't
 	 be converting the Llvm values into svals *)
@@ -250,6 +272,59 @@ let () =
   in
   ()
 ;;
+
+
+let gen_bin_op op =
+  Sllvmbuilder (fun [x; y] builder ->
+		  (builder, op x y "" builder))
+;;
+
+let global_vars = [| Variable "+"; 
+		     Variable "-"; 
+		     Variable "*";
+		     Variable "=";
+		     Variable "fact" |] ;;
+let global_vals = [| gen_bin_op build_add;
+		     gen_bin_op build_sub;
+		     gen_bin_op build_mul;
+		     Sllvmbuilder (fun [x; y] builder ->
+				     (builder, build_icmp Icmp.Eq x y "" builder));
+		     Sunbound |] ;;
+let globals = { frame_vars = global_vars;
+		frame_vals = global_vals } ;;
+
+let () =
+  let lambda = mkabs ["n"] (mkapp (mkref "+") [mkref "n"; lit_int 1])
+    (Some (function_type i64_type [| i64_type |]))
+  in
+  let expr = mkapp lambda [lit_int 44] in
+  let result = eval [globals] expr in
+  let () = match result with
+      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 45)
+    | _ -> assert false
+  in
+  ()
+;;
+
+let () =
+  let lambda = mkabs ["n"] (mkcnd 
+			      (mkapp (mkref "=") [mkref "n"; lit_int 1])
+			      (lit_int 1)
+			      (mkapp (mkref "fact") 
+				 [mkapp (mkref "-") [mkref "n"; lit_int 1]]))
+    (Some (function_type i64_type [| i64_type |]))
+  in
+  let expr = mkapp lambda [lit_int 5] in
+  let result = eval [globals] expr in
+  let () = match result with
+      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 120)
+    | _ -> assert false
+  in
+  ()
+;;
+
+
+
 
 let () = Llvm.dump_module cur_module ;;
 

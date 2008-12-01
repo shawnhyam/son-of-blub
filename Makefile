@@ -10,7 +10,7 @@ INCLUDES=-package extlib,unix
 LINKFLAGS=-linkpkg
 OCAMLOPTFLAGS=
 
-SRC_FILES := part2/son_of_blub.ml
+SRC_FILES := part3/son_of_blub.ml
 ML_FILES  := $(filter %.ml,$(patsubst %.mll,%.ml,$(SRC_FILES:%.mly=%.ml)))
 MLI_FILES := $(filter %.mli,$(SRC_FILES:%.mly=%.mli))
 CMX_FILES := $(ML_FILES:%.ml=%.cmx) 
