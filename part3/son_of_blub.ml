@@ -26,6 +26,7 @@ type ast =
   | Ast_cnd of ast * ast * ast
   | Ast_app of ast * ast array
   | Ast_abs of lambda
+  | Ast_define of variable * ast
 
 and lambda = {
   lam_ast : ast;
@@ -233,6 +234,7 @@ let mkabs params body lltype =
 	    lam_ast = body;
 	    lam_lltype = lltype } ;;
 let mkapp fn args = Ast_app (fn, Array.of_list args) ;;
+let mkdef name ast = Ast_define (mkvar name, ast)
 
 let () =
   let lambda = mkabs ["a"; "x"; "y"] 
@@ -322,13 +324,18 @@ let () =
 			      (mkapp (mkref "<") [mkref "n"; lit_int 3])
 			      (lit_int 1)
 			      (mkapp (mkref "+") 
-				 [mkapp (mkref "fact") 
+				 [mkapp (mkref "fib") 
 				    [mkapp (mkref "-") [mkref "n"; lit_int 2]];
-				  mkapp (mkref "fact") 
+				  mkapp (mkref "fib") 
 				    [mkapp (mkref "-") [mkref "n"; lit_int 1]]]))
     (Some (function_type i64_type [| i64_type |]))
   in
-  let expr = mkapp lambda [lit_int 40] in
+
+  let bind_it = mkdef "fib" lambda in
+  let _ = eval [globals] bind_it in
+
+  let expr = mkapp (mkref "fib") [lit_int 40] in
+
   let result = eval [globals] expr in
   let () = match result with
       Sllvm (t, v) when t = L.i64_type -> 
