@@ -16,29 +16,32 @@
 
 module EE = Llvm_executionengine.ExecutionEngine
 module GV = Llvm_executionengine.GenericValue
+module L = Llvm
 
 type variable = Variable of string
 
 type ast =
     Ast_lit of sval
   | Ast_ref of variable 
-  | Ast_cnd of ast * ast * ast  (* if part; then part; else part *)
+  | Ast_cnd of ast * ast * ast
   | Ast_app of ast * ast array
   | Ast_abs of lambda
 
 and lambda = {
   lam_ast : ast;
   lam_params : variable array;
-  lam_lltype : Llvm.lltype option;  (* this is a hack because we don't have a
-				       type system of any kind yet *)
+  lam_lltype : L.lltype option;  (* this is a hack because we don't have a
+				    type system of any kind yet *)
 }
 
 and sval =
     Sclosure of sclosure    (* closure is a fn + env *)
-  | Sllvm of Llvm.lltype * GV.t
-  | Sllvmbuilder of (Llvm.llvalue list -> Llvm.llbuilder -> (Llvm.llbuilder * Llvm.llvalue))
-  | Sprimfn of Llvm.llvalue
+  | Sllvm of L.lltype * GV.t
+  | Sllvminst of sinstbuilder
+  | Sprimfn of L.llvalue
   | Sunbound
+
+and sinstbuilder = L.llvalue list -> L.llbuilder -> (L.llbuilder * L.llvalue)
 
 and environment = frame list
 
@@ -52,7 +55,7 @@ and sclosure = {
   close_lam : lambda;
   (* we could either have this as part of the lambda (compiled without a
      local environment) or as part of a closure (compiled in an environment) *)
-  close_jitcode : (Llvm.lltype * Llvm.llvalue) Lazy.t  (* return value; code *)
+  close_jitcode : (L.lltype * L.llvalue) Lazy.t  (* fn sig; code *)
 }
 
 
@@ -77,8 +80,8 @@ exception Jit_failed
 open Llvm
 
 let llvm_val_of_int t x = Sllvm (t, GV.of_int t x) ;;
-let make_bool value = llvm_val_of_int Llvm.i1_type (if value then 1 else 0) ;;
-let make_int value = llvm_val_of_int Llvm.i64_type value ;;
+let make_bool value = llvm_val_of_int L.i1_type (if value then 1 else 0) ;;
+let make_int value = llvm_val_of_int L.i64_type value ;;
 
 let llvalue_of_gv t v =
   match t with
@@ -87,7 +90,7 @@ let llvalue_of_gv t v =
     | _ -> Format.printf "FAIL\n%!"; raise Jit_failed
 ;;
  
-let cur_module = Llvm.create_module "helloworld" ;;
+let cur_module = L.create_module "helloworld" ;;
 let jit = EE.create (ModuleProvider.create cur_module) ;;
 
 let compile_fn (env:environment) (lambda:lambda) = 
@@ -126,13 +129,11 @@ let compile_fn (env:environment) (lambda:lambda) =
 	end
       | Ast_cnd (pred, cons, alt) ->
 	  let builder, pred_val = gen_llvm builder pred in
-	  let test = build_icmp Icmp.Ne pred_val (const_int i1_type 0) 
-	    "test" builder in
 	  
 	  let cons_block = append_block "true_branch" cur_fn in
 	  let alt_block = append_block "false_branch" cur_fn in
 	  let join_block = append_block "join_branches" cur_fn in
-	  ignore (build_cond_br test cons_block alt_block builder);
+	  ignore (build_cond_br pred_val cons_block alt_block builder);
       
 	  let cons_builder = builder_at_end cons_block in
 	  let cons_builder, v1 = gen_llvm cons_builder cons in
@@ -156,8 +157,7 @@ let compile_fn (env:environment) (lambda:lambda) =
 	  in
 
 	  match find_in_env env var with
-	      Sllvmbuilder buildfn, _, _ -> 
-		Format.printf "OKOK\n%!";
+	      Sllvminst buildfn, _, _ -> 
 		buildfn llvals builder
 	    | Sprimfn fn, _, _ ->
 		(builder, build_call fn (Array.of_list llvals) "" builder)
@@ -169,7 +169,7 @@ let compile_fn (env:environment) (lambda:lambda) =
 
     let builder, retval = gen_llvm builder lambda.lam_ast in
     ignore (build_ret retval builder);
-    (rettype, cur_fn)
+    (fn_type, cur_fn)
 ;;
 
 
@@ -191,7 +191,7 @@ let rec eval env = function
       (* also note that this is Scheme-style semantics, where everything
 	 other than #f is considered #t *)
       match eval env pred with
-	  Sllvm (t, v) when t = Llvm.i1_type && (GV.as_int v = 0) ->
+	  Sllvm (t, v) when t = L.i1_type && (GV.as_int v = 0) ->
 	    eval env alt
 	| _ -> eval env cons
     end
@@ -204,12 +204,12 @@ and apply fn args =
   match fn with
       Sclosure close -> begin
 	try
-	  let rettype, fn = Lazy.force close.close_jitcode in
+	  let fntype, fn = Lazy.force close.close_jitcode in
 	  let args = Array.map (function
 				    Sllvm (_, v) -> v
 				  | _ -> raise Jit_failed) args in
 	  let result = EE.run_function fn args jit in
-	  Sllvm (rettype, result)
+	  Sllvm (return_type fntype, result)
 	with Jit_failed ->
 	  let frame = { frame_vars = close.close_lam.lam_params;
 			frame_vals = args } in
@@ -243,7 +243,7 @@ let () =
   let result = eval [] expr in
 
   match result with
-      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 34)
+      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 34)
     | _ -> assert false
 ;;
 
@@ -268,14 +268,14 @@ let () =
   (* invoke this result with 2 args #f and 34, should return 47 *)
   let expr' = mkapp (mklit result) [lit_bool false; lit_int 34] in
   let () = match eval [] expr' with
-      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 47)
+      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 47)
     | _ -> assert false
   in
 
   (* invoke with 2 args #t and 34, should return 34 *)
   let expr' = mkapp (mklit result) [lit_bool true; lit_int 34] in
   let () = match eval [] expr' with
-      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 34)
+      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 34)
     | _ -> assert false
   in
   ()
@@ -283,7 +283,7 @@ let () =
 
 
 let gen_bin_op op =
-  Sllvmbuilder (fun [x; y] builder ->
+  Sllvminst (fun [x; y] builder ->
 		  (builder, op x y "" builder))
 ;;
 
@@ -291,13 +291,16 @@ let global_vars = [| Variable "+";
 		     Variable "-"; 
 		     Variable "*";
 		     Variable "=";
-		     Variable "fact" |] ;;
+		     Variable "fact";
+		     Variable "<" |] ;;
 let global_vals = [| gen_bin_op build_add;
 		     gen_bin_op build_sub;
 		     gen_bin_op build_mul;
-		     Sllvmbuilder (fun [x; y] builder ->
+		     Sllvminst (fun [x; y] builder ->
 				     (builder, build_icmp Icmp.Eq x y "" builder));
-		     Sunbound |] ;;
+		     Sunbound;
+		     Sllvminst (fun [x; y] builder ->
+				     (builder, build_icmp Icmp.Slt x y "" builder)) |] ;;
 let globals = { frame_vars = global_vars;
 		frame_vals = global_vals } ;;
 
@@ -308,12 +311,34 @@ let () =
   let expr = mkapp lambda [lit_int 44] in
   let result = eval [globals] expr in
   let () = match result with
-      Sllvm (t, v) when t = Llvm.i64_type -> assert (GV.as_int v = 45)
+      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 45)
     | _ -> assert false
   in
   ()
 ;;
 
+let () =
+  let lambda = mkabs ["n"] (mkcnd 
+			      (mkapp (mkref "<") [mkref "n"; lit_int 3])
+			      (lit_int 1)
+			      (mkapp (mkref "+") 
+				 [mkapp (mkref "fact") 
+				    [mkapp (mkref "-") [mkref "n"; lit_int 2]];
+				  mkapp (mkref "fact") 
+				    [mkapp (mkref "-") [mkref "n"; lit_int 1]]]))
+    (Some (function_type i64_type [| i64_type |]))
+  in
+  let expr = mkapp lambda [lit_int 40] in
+  let result = eval [globals] expr in
+  let () = match result with
+      Sllvm (t, v) when t = L.i64_type -> 
+	Format.printf "answer: %d\n%!" (GV.as_int v);
+	assert (GV.as_int v = 102334155)
+    | _ -> assert false
+  in
+  ()
+;;
+(*
 let () =
   let lambda = mkabs ["n"] (mkcnd 
 			      (mkapp (mkref "=") [mkref "n"; lit_int 1])
@@ -327,7 +352,7 @@ let () =
   let expr = mkapp lambda [lit_int 5] in
   let result = eval [globals] expr in
   let () = match result with
-      Sllvm (t, v) when t = Llvm.i64_type -> 
+      Sllvm (t, v) when t = L.i64_type -> 
 	Format.printf "answer: %d\n%!" (GV.as_int v);
 	assert (GV.as_int v = 120)
     | _ -> assert false
@@ -335,9 +360,9 @@ let () =
   ()
 ;;
 
-
-
-(*
-let () = Llvm.dump_module cur_module ;;
 *)
+
+
+let () = L.dump_module cur_module ;;
+
 
