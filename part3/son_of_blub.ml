@@ -9,7 +9,7 @@
 
   Must have support in the JIT compiler for invoking other functions; in
   this case, it is a recursive invocation.
-    (define fact (lambda (n) (if (= n 0) 1 ( * n (fact (- n 1))))))
+    (define fact (lambda (n) (if (< n 3) 1 ( * n (fact (- n 1))))))
 
   Use the fast calling convention.
 *)
@@ -84,7 +84,6 @@ let find_in_env globals env v : (sval * binding) =
 (* LLVM SECTION *)
 
 exception Jit_failed
-open Llvm
 
 let llvm_val_of_int t x = Sllvm (t, GV.of_int t x) ;;
 let make_bool value = llvm_val_of_int L.i1_type (if value then 1 else 0) ;;
@@ -92,13 +91,13 @@ let make_int value = llvm_val_of_int L.i64_type value ;;
 
 let llvalue_of_gv t v =
   match t with
-      i1_type -> const_int t (GV.as_int v)
-    | i64_type -> const_of_int64 t (GV.as_int64 v) true (* WTF is the bool for? *)
+      i1_type -> L.const_int t (GV.as_int v)
+    | i64_type -> L.const_of_int64 t (GV.as_int64 v) true (* WTF is the bool for? *)
     | _ -> Format.printf "FAIL\n%!"; raise Jit_failed
 ;;
- 
+
 let cur_module = L.create_module "helloworld" ;;
-let jit = EE.create (ModuleProvider.create cur_module) ;;
+let jit = EE.create (L.ModuleProvider.create cur_module) ;;
 
 let compile_fn ?fn globals (env:environment) (lambda:lambda) = 
   (* add the params to the environment; but the params should be accessed
@@ -113,12 +112,12 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
 	raise Jit_failed
   in
   let cur_fn = match fn with
-      None -> define_function "lambda" fn_type cur_module 
+      None -> L.define_function "lambda" fn_type cur_module 
     | Some x -> x
   in
-  let builder = builder_at_end (entry_block cur_fn) in
+  let builder = L.builder_at_end (L.entry_block cur_fn) in
 
-  let rec gen_llvm (builder:llbuilder) (ast:ast) : (llbuilder * llvalue) =
+  let rec gen_llvm (builder:L.llbuilder) (ast:ast) : (L.llbuilder * L.llvalue) =
     match ast with
 	Ast_lit (Sllvm (t, v)) -> 
 	  let lit_val = llvalue_of_gv t v in
@@ -129,7 +128,7 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
       | Ast_ref var -> begin
 	  try
 	    match find_in_env globals env var with
-		_, Lref (0, offset) -> (builder, param cur_fn offset)
+		_, Lref (0, offset) -> (builder, L.param cur_fn offset)
 	      | Sllvm (t, v), _ -> (builder, llvalue_of_gv t v)
 	      | _ -> 
 		  Format.printf "Var lookup failed\n%!";
@@ -142,21 +141,21 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
       | Ast_cnd (pred, cons, alt) ->
 	  let builder, pred_val = gen_llvm builder pred in
 	  
-	  let cons_block = append_block "true_branch" cur_fn in
-	  let alt_block = append_block "false_branch" cur_fn in
-	  let join_block = append_block "join_branches" cur_fn in
-	  ignore (build_cond_br pred_val cons_block alt_block builder);
+	  let cons_block = L.append_block "true_branch" cur_fn in
+	  let alt_block = L.append_block "false_branch" cur_fn in
+	  let join_block = L.append_block "join_branches" cur_fn in
+	  ignore (L.build_cond_br pred_val cons_block alt_block builder);
       
-	  let cons_builder = builder_at_end cons_block in
+	  let cons_builder = L.builder_at_end cons_block in
 	  let cons_builder, v1 = gen_llvm cons_builder cons in
-	  ignore (build_br join_block cons_builder);
+	  ignore (L.build_br join_block cons_builder);
 	
-	  let alt_builder = builder_at_end alt_block in
+	  let alt_builder = L.builder_at_end alt_block in
 	  let alt_builder, v2 = gen_llvm alt_builder alt in
-	  ignore (build_br join_block alt_builder);
+	  ignore (L.build_br join_block alt_builder);
 
-	  let join_builder = builder_at_end join_block in
-	  let return = build_phi [(v1, cons_block); (v2, alt_block)] 
+	  let join_builder = L.builder_at_end join_block in
+	  let return = L.build_phi [(v1, cons_block); (v2, alt_block)] 
 	    "phi" join_builder in
 	  (join_builder, return)
       | Ast_abs _ -> 
@@ -174,7 +173,7 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
 	  match find_in_env globals env var with
 	      Sllvminst buildfn, _ -> buildfn llvals builder
 	    | Sprimfn (_, fn), _ ->
-		(builder, build_call fn (Array.of_list llvals) "" builder)
+		(builder, L.build_call fn (Array.of_list llvals) "" builder)
 	    | _ -> 
 		let Variable v = var in
 		Format.printf "Var %s not found\n%!" v;
@@ -187,7 +186,7 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
     in
 
     let builder, retval = gen_llvm builder lambda.lam_ast in
-    ignore (build_ret retval builder);
+    ignore (L.build_ret retval builder);
     (fn_type, cur_fn)
 ;;
 
@@ -222,7 +221,7 @@ let eval globals expr =
 	let Some fn_type = lambda.lam_lltype in
 	match find_in_env globals [] var with
 	    _, Gref idx -> 
-	      let cur_fn = define_function v fn_type cur_module in
+	      let cur_fn = L.define_function v fn_type cur_module in
 	      globals.frame_vals.(idx) <- Sprimfn (fn_type, cur_fn);
 	      compile_fn ~fn:cur_fn globals env lambda;
 	      globals.frame_vals.(idx)
@@ -242,7 +241,7 @@ let eval globals expr =
 	    let fntype, fn = Lazy.force close.close_jitcode in
 	    let args = prepare_llvm_args args in
 	    let result = EE.run_function fn args jit in
-	    Sllvm (return_type fntype, result)
+	    Sllvm (L.return_type fntype, result)
 	  with Jit_failed ->
 	    let frame = { frame_vars = close.close_lam.lam_params;
 			  frame_vals = args } in
@@ -253,7 +252,7 @@ let eval globals expr =
 	  Format.printf "Executing primitive function\n%!";
 	  let args = prepare_llvm_args args in
 	  let result = EE.run_function fn args jit in
-	  Sllvm (return_type fntype, result)
+	  Sllvm (L.return_type fntype, result)
   in
   eval [] expr
 ;;
@@ -272,95 +271,36 @@ let mkabs params body lltype =
 	    lam_ast = body;
 	    lam_lltype = lltype } ;;
 let mkapp fn args = Ast_app (fn, Array.of_list args) ;;
-let mkdef name ast = Ast_define (mkvar name, ast)
+let mkdef name ast = Ast_define (mkvar name, ast) ;;
 
-(*
-let () =
-  let lambda = mkabs ["a"; "x"; "y"] 
-    (mkcnd (mkref "a") (mkref "x") (mkref "y"))
-    (Some (function_type i64_type [| i1_type; i64_type; i64_type |]))
-  in
-  let expr = mkapp lambda [lit_bool true; lit_int 34; lit_int 47] in
-  let result = eval { frame_vars = [||]; frame_vals = [||] } expr in
-
-  match result with
-      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 34)
-    | _ -> assert false
-;;
-
-let () =
-  (* (lambda (a x) (if a x y)) *)
-  let lambda1 = mkabs ["a"; "x"] 
-    (mkcnd (mkref "a") (mkref "x") (mkref "y"))
-    (Some (function_type i64_type [| i1_type; i64_type |]))
-  in
-  (* this is a function that takes param 'y' and returns a function with
-     2 params, 'a' and 'x' -- this function return 'x' if 'a' is #t,
-     'y' otherwise   (lambda (y) (lambda (a x) (if a x y)))   *)
-  let lambda2 = mkabs ["y"] lambda1 None in (* can't type this _yet_ *)
-  let expr = mkapp lambda2 [lit_int 47] in
-  let result = eval { frame_vars = [||]; frame_vals = [||] } expr in
-  (* result should be a function that takes 2 params 'a' and 'x' *)
-  let () = match result with
-      Sclosure _ -> ()
-    | _ -> assert false
-  in
-
-  (* invoke this result with 2 args #f and 34, should return 47 *)
-  let expr' = mkapp (mklit result) [lit_bool false; lit_int 34] in
-  let () = match eval { frame_vars = [||]; frame_vals = [||] } expr' with
-      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 47)
-    | _ -> assert false
-  in
-
-  (* invoke with 2 args #t and 34, should return 34 *)
-  let expr' = mkapp (mklit result) [lit_bool true; lit_int 34] in
-  let () = match eval { frame_vars = [||]; frame_vals = [||] } expr' with
-      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 34)
-    | _ -> assert false
-  in
-  ()
-;;
-*)
 
 let gen_bin_op op =
   Sllvminst (fun [x; y] builder ->
 		  (builder, op x y "" builder))
 ;;
 
-let global_vars = [| Variable "+"; 
-		     Variable "-"; 
-		     Variable "*";
-		     Variable "=";
-		     Variable "fact";
-		     Variable "fib";
-		     Variable "<" |] ;;
-let global_vals = [| gen_bin_op build_add;
-		     gen_bin_op build_sub;
-		     gen_bin_op build_mul;
-		     Sllvminst (fun [x; y] builder ->
-				     (builder, build_icmp Icmp.Eq x y "" builder));
-		     Sunbound;
-		     Sunbound;
-		     Sllvminst (fun [x; y] builder ->
-				     (builder, build_icmp Icmp.Slt x y "" builder)) |] ;;
-let globals = { frame_vars = global_vars;
-		frame_vals = global_vals } ;;
-
-(*
-let () =
-  let lambda = mkabs ["n"] (mkapp (mkref "+") [mkref "n"; lit_int 1])
-    (Some (function_type i64_type [| i64_type |]))
+let make_global_env bindings =
+  let vars, vals = List.fold_left (fun (vars, vals) (var, value) ->
+				     ((Variable var) :: vars, value :: vals))
+    ([], []) bindings
   in
-  let expr = mkapp lambda [lit_int 44] in
-  let result = eval globals expr in
-  let () = match result with
-      Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 45)
-    | _ -> assert false
-  in
-  ()
+  { frame_vars = Array.of_list vars;
+    frame_vals = Array.of_list vals }
 ;;
-*)
+
+let globals = [ 
+  "+", gen_bin_op L.build_add;
+  "-", gen_bin_op L.build_sub;
+  "*", gen_bin_op L.build_mul;
+  "=", Sllvminst (fun [x; y] builder ->
+		    (builder, L.build_icmp L.Icmp.Eq x y "" builder));
+  "fact", Sunbound;
+  "fib", Sunbound;
+  "<", Sllvminst (fun [x; y] builder ->
+		    (builder, L.build_icmp L.Icmp.Slt x y "" builder)) 
+] ;;
+		
+let globals = make_global_env globals ;;
 
 let () =
   let lambda = mkabs ["n"] (mkcnd 
@@ -371,7 +311,7 @@ let () =
 				    [mkapp (mkref "-") [mkref "n"; lit_int 2]];
 				  mkapp (mkref "fib") 
 				    [mkapp (mkref "-") [mkref "n"; lit_int 1]]]))
-    (Some (function_type i64_type [| i64_type |]))
+    (Some (L.function_type L.i64_type [| L.i64_type |]))
   in
 
   let bind_it = mkdef "fib" lambda in
@@ -388,29 +328,6 @@ let () =
   in
   ()
 ;;
-(*
-let () =
-  let lambda = mkabs ["n"] (mkcnd 
-			      (mkapp (mkref "=") [mkref "n"; lit_int 1])
-			      (lit_int 1)
-			      (mkapp (mkref "*") 
-				 [mkref "n";
-				  (mkapp (mkref "fact") 
-				     [mkapp (mkref "-") [mkref "n"; lit_int 1]])]))
-    (Some (function_type i64_type [| i64_type |]))
-  in
-  let expr = mkapp lambda [lit_int 5] in
-  let result = eval [globals] expr in
-  let () = match result with
-      Sllvm (t, v) when t = L.i64_type -> 
-	Format.printf "answer: %d\n%!" (GV.as_int v);
-	assert (GV.as_int v = 120)
-    | _ -> assert false
-  in
-  ()
-;;
-
-*)
 
 (*
 let () = L.dump_module cur_module ;;
