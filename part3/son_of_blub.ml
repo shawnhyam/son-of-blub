@@ -38,7 +38,7 @@ and sval =
     Sclosure of sclosure    (* closure is a fn + env *)
   | Sllvm of L.lltype * GV.t
   | Sllvminst of sinstbuilder
-  | Sprimfn of L.llvalue
+  | Sprimfn of sprimitive
   | Sunbound
 
 and sinstbuilder = L.llvalue list -> L.llbuilder -> (L.llbuilder * L.llvalue)
@@ -55,9 +55,10 @@ and sclosure = {
   close_lam : lambda;
   (* we could either have this as part of the lambda (compiled without a
      local environment) or as part of a closure (compiled in an environment) *)
-  close_jitcode : (L.lltype * L.llvalue) Lazy.t  (* fn sig; code *)
+  close_jitcode : sprimitive Lazy.t 
 }
 
+and sprimitive = L.lltype * L.llvalue  (* fn sig; code *)
 
 (* BASIC UTILITIES *)
 
@@ -102,13 +103,12 @@ let compile_fn (env:environment) (lambda:lambda) =
   let fn_type = match lambda.lam_lltype with
       Some t -> t | None -> raise Jit_failed
   in
-  let rettype = return_type fn_type in
   let cur_fn = define_function "lambda" fn_type cur_module in
 
   (* MAJOR MAJOR HACK to get fact function to work *)
   let global_frame = List.nth env ((List.length env)-1) in
   if (Array.length global_frame.frame_vals > 4) then
-    global_frame.frame_vals.(4) <- Sprimfn cur_fn;
+    global_frame.frame_vals.(4) <- Sprimfn (fn_type, cur_fn);
 
   let builder = builder_at_end (entry_block cur_fn) in
 
@@ -149,6 +149,7 @@ let compile_fn (env:environment) (lambda:lambda) =
 	  (join_builder, return)
       | Ast_abs _ -> raise Jit_failed  (* coming soon... *)
       | Ast_app (Ast_ref var, params) -> begin
+	  (* compile the code for each of the params *)
 	  let builder, llvals = Array.fold_right
 	    (fun param (builder, llvals) ->
 	       let builder', llval = gen_llvm builder param in
@@ -157,9 +158,8 @@ let compile_fn (env:environment) (lambda:lambda) =
 	  in
 
 	  match find_in_env env var with
-	      Sllvminst buildfn, _, _ -> 
-		buildfn llvals builder
-	    | Sprimfn fn, _, _ ->
+	      Sllvminst buildfn, _, _ -> buildfn llvals builder
+	    | Sprimfn (_, fn), _, _ ->
 		(builder, build_call fn (Array.of_list llvals) "" builder)
 	    | _ -> raise Jit_failed
 	end
