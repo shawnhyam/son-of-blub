@@ -19,10 +19,11 @@ module GV = Llvm_executionengine.GenericValue
 module L = Llvm
 
 type variable = Variable of string
+type binding = Lref of (int * int) | Gref of int
 
 type ast =
     Ast_lit of sval
-  | Ast_ref of variable 
+  | Ast_ref of variable
   | Ast_cnd of ast * ast * ast
   | Ast_app of ast * ast array
   | Ast_abs of lambda
@@ -63,17 +64,21 @@ and sprimitive = L.lltype * L.llvalue  (* fn sig; code *)
 
 (* BASIC UTILITIES *)
 
-let find_in_env env v : (sval * int * int) =
+let find_in_env globals env v : (sval * binding) =
   let rec find frame_idx = function
       [] -> raise Not_found
     | frame :: env ->
 	try
 	  let offset = ExtArray.Array.findi ((=) v) frame.frame_vars in
-	  (frame.frame_vals.(offset), frame_idx, offset)
+	  (frame.frame_vals.(offset), Lref (frame_idx, offset))
 	with Not_found ->
 	  find (frame_idx+1) env
   in
-  find 0 env
+  try
+    let idx = ExtArray.Array.findi ((=) v) globals.frame_vars in
+    (globals.frame_vals.(idx), Gref idx)
+  with Not_found ->
+    find 0 env
 ;;
 
 (* LLVM SECTION *)
@@ -95,22 +100,22 @@ let llvalue_of_gv t v =
 let cur_module = L.create_module "helloworld" ;;
 let jit = EE.create (ModuleProvider.create cur_module) ;;
 
-let compile_fn (env:environment) (lambda:lambda) = 
+let compile_fn ?fn globals (env:environment) (lambda:lambda) = 
   (* add the params to the environment; but the params should be accessed
      differently from the surrounding frames *)
   let frame = { frame_vars = lambda.lam_params;
 		frame_vals = Array.map (fun _ -> Sunbound) lambda.lam_params } in
   let env = frame :: env in
   let fn_type = match lambda.lam_lltype with
-      Some t -> t | None -> raise Jit_failed
+      Some t -> t 
+    | None -> 
+	Format.printf "Unknown type for this function\n%!";
+	raise Jit_failed
   in
-  let cur_fn = define_function "lambda" fn_type cur_module in
-
-  (* MAJOR MAJOR HACK to get fact function to work *)
-  let global_frame = List.nth env ((List.length env)-1) in
-  if (Array.length global_frame.frame_vals > 4) then
-    global_frame.frame_vals.(4) <- Sprimfn (fn_type, cur_fn);
-
+  let cur_fn = match fn with
+      None -> define_function "lambda" fn_type cur_module 
+    | Some x -> x
+  in
   let builder = builder_at_end (entry_block cur_fn) in
 
   let rec gen_llvm (builder:llbuilder) (ast:ast) : (llbuilder * llvalue) =
@@ -118,14 +123,20 @@ let compile_fn (env:environment) (lambda:lambda) =
 	Ast_lit (Sllvm (t, v)) -> 
 	  let lit_val = llvalue_of_gv t v in
 	  (builder, lit_val)
-      | Ast_lit _ -> raise Jit_failed  (* can't handle other types yet *)
+      | Ast_lit _ -> 
+	  Format.printf "Can't handle Lit nodes yet\n%!";
+	  raise Jit_failed
       | Ast_ref var -> begin
 	  try
-	    match find_in_env env var with
-		_, 0, offset -> (builder, param cur_fn offset)
-	      | Sllvm (t, v), _, _ -> (builder, llvalue_of_gv t v)
-	      | _ -> raise Jit_failed
+	    match find_in_env globals env var with
+		_, Lref (0, offset) -> (builder, param cur_fn offset)
+	      | Sllvm (t, v), _ -> (builder, llvalue_of_gv t v)
+	      | _ -> 
+		  Format.printf "Var lookup failed\n%!";
+		  raise Jit_failed
 	  with Not_found ->
+	    let Variable v = var in
+	    Format.printf "Var %s not currently bound in env\n%!" v;
 	    raise Jit_failed
 	end
       | Ast_cnd (pred, cons, alt) ->
@@ -148,7 +159,9 @@ let compile_fn (env:environment) (lambda:lambda) =
 	  let return = build_phi [(v1, cons_block); (v2, alt_block)] 
 	    "phi" join_builder in
 	  (join_builder, return)
-      | Ast_abs _ -> raise Jit_failed  (* coming soon... *)
+      | Ast_abs _ -> 
+	  Format.printf "Can't compile Abs node yet\n%!";
+	  raise Jit_failed  (* coming soon... *)
       | Ast_app (Ast_ref var, params) -> begin
 	  (* compile the code for each of the params *)
 	  let builder, llvals = Array.fold_right
@@ -158,14 +171,19 @@ let compile_fn (env:environment) (lambda:lambda) =
 	    params (builder, [])
 	  in
 
-	  match find_in_env env var with
-	      Sllvminst buildfn, _, _ -> buildfn llvals builder
-	    | Sprimfn (_, fn), _, _ ->
+	  match find_in_env globals env var with
+	      Sllvminst buildfn, _ -> buildfn llvals builder
+	    | Sprimfn (_, fn), _ ->
 		(builder, build_call fn (Array.of_list llvals) "" builder)
-	    | _ -> raise Jit_failed
+	    | _ -> 
+		let Variable v = var in
+		Format.printf "Var %s not found\n%!" v;
+		raise Jit_failed
 	end
 	  
-      | Ast_app _ -> raise Jit_failed  (* also coming soon? *)
+      | Ast_app _ -> 
+	  Format.printf "App node not yet fully supported\n%!";
+	  raise Jit_failed  (* also coming soon? *)
     in
 
     let builder, retval = gen_llvm builder lambda.lam_ast in
@@ -176,48 +194,68 @@ let compile_fn (env:environment) (lambda:lambda) =
 
 (* INTERPRETER SECTION *)
 
-let rec eval env = function 
-    Ast_lit lit -> lit
-  | Ast_ref var -> begin
-      try
-	let v, _, _ = find_in_env env var in v
-      with Not_found as ex ->
-	let Variable v = var in
-	Format.printf "Variable %s not found\n%!" v;
-	raise ex
-    end
-  | Ast_cnd (pred, cons, alt) -> begin
-      (* we will just treat it as an i1_type because in general we won't
-	 be converting the Llvm values into svals *)
-      (* also note that this is Scheme-style semantics, where everything
-	 other than #f is considered #t *)
-      match eval env pred with
-	  Sllvm (t, v) when t = L.i1_type && (GV.as_int v = 0) ->
-	    eval env alt
-	| _ -> eval env cons
-    end
-  | Ast_app (fn, args) -> apply (eval env fn) (Array.map (eval env) args)    
-  | Ast_abs lambda ->
-      Sclosure { close_env = env; 
-		 close_lam = lambda;
-		 close_jitcode = lazy (compile_fn env lambda) }
-and apply fn args =
-  match fn with
-      Sclosure close -> begin
+let eval globals expr =
+  let rec eval env = function 
+      Ast_lit lit -> lit
+    | Ast_ref var -> begin
 	try
-	  let fntype, fn = Lazy.force close.close_jitcode in
-	  let args = Array.map (function
-				    Sllvm (_, v) -> v
-				  | _ -> raise Jit_failed) args in
+	  let v, _ = find_in_env globals env var in v
+	with Not_found as ex ->
+	  let Variable v = var in
+	  Format.printf "Variable %s not found\n%!" v;
+	  raise ex
+      end
+    | Ast_cnd (pred, cons, alt) -> begin
+	(* we will just treat it as an i1_type because in general we won't
+	   be converting the Llvm values into svals *)
+	match eval env pred with
+	    Sllvm (t, v) when t = L.i1_type && (GV.as_int v = 0) ->
+	      eval env alt
+	  | _ -> eval env cons
+      end
+    | Ast_app (fn, args) -> apply (eval env fn) (Array.map (eval env) args)    
+    | Ast_abs lambda ->
+	Sclosure { close_env = env; 
+		   close_lam = lambda;
+		   close_jitcode = lazy (compile_fn globals env lambda) }
+    | Ast_define (Variable v as var, Ast_abs lambda) -> begin
+	let Some fn_type = lambda.lam_lltype in
+	match find_in_env globals [] var with
+	    _, Gref idx -> 
+	      let cur_fn = define_function v fn_type cur_module in
+	      globals.frame_vals.(idx) <- Sprimfn (fn_type, cur_fn);
+	      compile_fn ~fn:cur_fn globals env lambda;
+	      globals.frame_vals.(idx)
+	      
+      end
+	
+  and apply fn args =
+    let prepare_llvm_args args =
+      Array.map (function
+		     Sllvm (_, v) -> v
+		   | _ -> Format.printf "arg conversion failed\n%!";
+		       raise Jit_failed) args
+    in
+    match fn with
+	Sclosure close -> begin
+	  try
+	    let fntype, fn = Lazy.force close.close_jitcode in
+	    let args = prepare_llvm_args args in
+	    let result = EE.run_function fn args jit in
+	    Sllvm (return_type fntype, result)
+	  with Jit_failed ->
+	    let frame = { frame_vars = close.close_lam.lam_params;
+			  frame_vals = args } in
+	    let env' = frame :: close.close_env in
+	    eval env' close.close_lam.lam_ast
+	end
+      | Sprimfn (fntype, fn) -> 
+	  Format.printf "Executing primitive function\n%!";
+	  let args = prepare_llvm_args args in
 	  let result = EE.run_function fn args jit in
 	  Sllvm (return_type fntype, result)
-	with Jit_failed ->
-	  let frame = { frame_vars = close.close_lam.lam_params;
-			frame_vals = args } in
-	  let env' = frame :: close.close_env in
-	  eval env' close.close_lam.lam_ast
-      end
-    | _ -> assert false  (* no other values we can 'apply' yet *)
+  in
+  eval [] expr
 ;;
 
 
@@ -236,13 +274,14 @@ let mkabs params body lltype =
 let mkapp fn args = Ast_app (fn, Array.of_list args) ;;
 let mkdef name ast = Ast_define (mkvar name, ast)
 
+(*
 let () =
   let lambda = mkabs ["a"; "x"; "y"] 
     (mkcnd (mkref "a") (mkref "x") (mkref "y"))
     (Some (function_type i64_type [| i1_type; i64_type; i64_type |]))
   in
   let expr = mkapp lambda [lit_bool true; lit_int 34; lit_int 47] in
-  let result = eval [] expr in
+  let result = eval { frame_vars = [||]; frame_vals = [||] } expr in
 
   match result with
       Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 34)
@@ -260,7 +299,7 @@ let () =
      'y' otherwise   (lambda (y) (lambda (a x) (if a x y)))   *)
   let lambda2 = mkabs ["y"] lambda1 None in (* can't type this _yet_ *)
   let expr = mkapp lambda2 [lit_int 47] in
-  let result = eval [] expr in
+  let result = eval { frame_vars = [||]; frame_vals = [||] } expr in
   (* result should be a function that takes 2 params 'a' and 'x' *)
   let () = match result with
       Sclosure _ -> ()
@@ -269,20 +308,20 @@ let () =
 
   (* invoke this result with 2 args #f and 34, should return 47 *)
   let expr' = mkapp (mklit result) [lit_bool false; lit_int 34] in
-  let () = match eval [] expr' with
+  let () = match eval { frame_vars = [||]; frame_vals = [||] } expr' with
       Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 47)
     | _ -> assert false
   in
 
   (* invoke with 2 args #t and 34, should return 34 *)
   let expr' = mkapp (mklit result) [lit_bool true; lit_int 34] in
-  let () = match eval [] expr' with
+  let () = match eval { frame_vars = [||]; frame_vals = [||] } expr' with
       Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 34)
     | _ -> assert false
   in
   ()
 ;;
-
+*)
 
 let gen_bin_op op =
   Sllvminst (fun [x; y] builder ->
@@ -294,6 +333,7 @@ let global_vars = [| Variable "+";
 		     Variable "*";
 		     Variable "=";
 		     Variable "fact";
+		     Variable "fib";
 		     Variable "<" |] ;;
 let global_vals = [| gen_bin_op build_add;
 		     gen_bin_op build_sub;
@@ -301,23 +341,26 @@ let global_vals = [| gen_bin_op build_add;
 		     Sllvminst (fun [x; y] builder ->
 				     (builder, build_icmp Icmp.Eq x y "" builder));
 		     Sunbound;
+		     Sunbound;
 		     Sllvminst (fun [x; y] builder ->
 				     (builder, build_icmp Icmp.Slt x y "" builder)) |] ;;
 let globals = { frame_vars = global_vars;
 		frame_vals = global_vals } ;;
 
+(*
 let () =
   let lambda = mkabs ["n"] (mkapp (mkref "+") [mkref "n"; lit_int 1])
     (Some (function_type i64_type [| i64_type |]))
   in
   let expr = mkapp lambda [lit_int 44] in
-  let result = eval [globals] expr in
+  let result = eval globals expr in
   let () = match result with
       Sllvm (t, v) when t = L.i64_type -> assert (GV.as_int v = 45)
     | _ -> assert false
   in
   ()
 ;;
+*)
 
 let () =
   let lambda = mkabs ["n"] (mkcnd 
@@ -332,11 +375,11 @@ let () =
   in
 
   let bind_it = mkdef "fib" lambda in
-  let _ = eval [globals] bind_it in
+  let _ = eval globals bind_it in
 
   let expr = mkapp (mkref "fib") [lit_int 40] in
 
-  let result = eval [globals] expr in
+  let result = eval globals expr in
   let () = match result with
       Sllvm (t, v) when t = L.i64_type -> 
 	Format.printf "answer: %d\n%!" (GV.as_int v);
@@ -369,7 +412,8 @@ let () =
 
 *)
 
-
+(*
 let () = L.dump_module cur_module ;;
+*)
 
 
