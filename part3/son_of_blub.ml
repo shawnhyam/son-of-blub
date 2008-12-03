@@ -45,6 +45,8 @@ and sval =
 
 and sinstbuilder = L.llvalue list -> L.llbuilder -> (L.llbuilder * L.llvalue)
 
+and global_environment = (variable * sval) DynArray.t
+
 and environment = frame list
 
 and frame = {
@@ -64,6 +66,8 @@ and sprimitive = L.lltype * L.llvalue  (* fn sig; code *)
 
 (* BASIC UTILITIES *)
 
+exception Found of (sval * binding)
+
 let find_in_env globals env v : (sval * binding) =
   let rec find frame_idx = function
       [] -> raise Not_found
@@ -75,10 +79,13 @@ let find_in_env globals env v : (sval * binding) =
 	  find (frame_idx+1) env
   in
   try
-    let idx = ExtArray.Array.findi ((=) v) globals.frame_vars in
-    (globals.frame_vals.(idx), Gref idx)
-  with Not_found ->
+    DynArray.iteri (fun idx (var_name, var_val) ->
+		      if var_name = v then 
+			raise (Found (var_val, Gref idx)))
+      globals;
     find 0 env
+  with Found result ->
+    result
 ;;
 
 (* LLVM SECTION *)
@@ -193,7 +200,7 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
 
 (* INTERPRETER SECTION *)
 
-let eval globals expr =
+let eval (globals:global_environment) expr =
   let rec eval env = function 
       Ast_lit lit -> lit
     | Ast_ref var -> begin
@@ -219,13 +226,19 @@ let eval globals expr =
 		   close_jitcode = lazy (compile_fn globals env lambda) }
     | Ast_define (Variable v as var, Ast_abs lambda) -> begin
 	let Some fn_type = lambda.lam_lltype in
-	match find_in_env globals [] var with
-	    _, Gref idx -> 
-	      let cur_fn = L.define_function v fn_type cur_module in
-	      globals.frame_vals.(idx) <- Sprimfn (fn_type, cur_fn);
-	      compile_fn ~fn:cur_fn globals env lambda;
-	      globals.frame_vals.(idx)
-	      
+	let idx = try
+	  match find_in_env globals [] var with
+	      _, Gref idx -> idx
+	with Not_found ->
+	  let i = DynArray.length globals in
+	  DynArray.add globals (var, Sunbound);
+	  i
+	in
+	let cur_fn = L.define_function v fn_type cur_module in
+	DynArray.set globals idx (var, Sprimfn (fn_type, cur_fn));
+	compile_fn ~fn:cur_fn globals env lambda;
+	let _, sval = DynArray.get globals idx in
+	sval
       end
 	
   and apply fn args =
@@ -280,12 +293,7 @@ let gen_bin_op op =
 ;;
 
 let make_global_env bindings =
-  let vars, vals = List.fold_left (fun (vars, vals) (var, value) ->
-				     ((Variable var) :: vars, value :: vals))
-    ([], []) bindings
-  in
-  { frame_vars = Array.of_list vars;
-    frame_vals = Array.of_list vals }
+  DynArray.of_list (List.map (fun (var, sval) -> (Variable var, sval)) bindings)
 ;;
 
 let globals = [ 
@@ -294,8 +302,6 @@ let globals = [
   "*", gen_bin_op L.build_mul;
   "=", Sllvminst (fun [x; y] builder ->
 		    (builder, L.build_icmp L.Icmp.Eq x y "" builder));
-  "fact", Sunbound;
-  "fib", Sunbound;
   "<", Sllvminst (fun [x; y] builder ->
 		    (builder, L.build_icmp L.Icmp.Slt x y "" builder)) 
 ] ;;
