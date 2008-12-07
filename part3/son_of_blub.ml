@@ -300,10 +300,18 @@ let globals = [
   "+", gen_bin_op L.build_add;
   "-", gen_bin_op L.build_sub;
   "*", gen_bin_op L.build_mul;
+  "/", gen_bin_op L.build_sdiv;
   "=", Sllvminst (fun [x; y] builder ->
 		    (builder, L.build_icmp L.Icmp.Eq x y "" builder));
   "<", Sllvminst (fun [x; y] builder ->
-		    (builder, L.build_icmp L.Icmp.Slt x y "" builder)) 
+		    (builder, L.build_icmp L.Icmp.Slt x y "" builder));
+  "<=", Sllvminst (fun [x; y] builder ->
+		    (builder, L.build_icmp L.Icmp.Sle x y "" builder));
+  ">", Sllvminst (fun [x; y] builder ->
+		    (builder, L.build_icmp L.Icmp.Sgt x y "" builder));
+  ">=", Sllvminst (fun [x; y] builder ->
+		    (builder, L.build_icmp L.Icmp.Sge x y "" builder));
+
 ] ;;
 		
 let globals = make_global_env globals ;;
