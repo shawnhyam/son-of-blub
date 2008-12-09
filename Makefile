@@ -1,4 +1,12 @@
-export PATH:=.:$(shell pwd)/extern/bin:$(PATH)
+FEATURES:=$(sort $(filter target-specific order-only second-expansion,$(.FEATURES)))
+ifneq (order-only second-expansion target-specific,$(FEATURES))
+$(error Your version of make does not support the required features.)
+endif
+
+.PHONY: all
+all: $(addprefix bin/,part1 part2 part3)
+
+export PATH:=$(abspath extern/bin):$(PATH)
 OCAMLC=ocamlc 
 OCAMLOPT=ocamlopt 
 OCAMLLEX=ocamllex
@@ -10,13 +18,29 @@ INCLUDES=-package extlib,unix
 LINKFLAGS=-linkpkg
 OCAMLOPTFLAGS=
 
-SRC_FILES := part3/son_of_blub.ml
-ML_FILES  := $(filter %.ml,$(patsubst %.mll,%.ml,$(SRC_FILES:%.mly=%.ml)))
-MLI_FILES := $(filter %.mli,$(SRC_FILES:%.mly=%.mli))
-CMX_FILES := $(ML_FILES:%.ml=%.cmx) 
-CMO_FILES := $(ML_FILES:%.ml=%.cmo)
-CMI_FILES := $(MLI_FILES:%.mli=%.cmi) $(ML_FILES:%.ml=%.cmi)
-GARBAGE := $(filter-out $(SRC_FILES),$(ML_FILES) $(MLI_FILES) $(CMX_FILES) $(CMX_FILES:%.cmx=%.o) $(CMO_FILES) $(CMI_FILES) interpreter .depend)
+LLVMMODULES:=llvm_bitwriter llvm_executionengine llvm llvm_scalar_opts
+LLVMOC:=$(LLVMMODULES:%=%.cmxa)
+LLVML:=$(addprefix -cclib ,$(LLVMMODULES:%=-l%))
+
+# A little function to get all the ml files that can be created from the sources
+get-ml-files= $(filter  %.ml,$(patsubst %.mly,%.ml,$(patsubst %.mll,%.ml,$(1))))
+get-mli-files=$(filter %.mli,$(patsubst %.mly,%.mli,$(1)))
+
+part1_SRC_FILES := part1/barebones_blub.ml
+part2_SRC_FILES := part2/son_of_blub.ml
+part3_SRC_FILES := part3/son_of_blub.ml
+
+part:=part1
+include partN.mk
+part:=part2
+include partN.mk
+part:=part3
+include partN.mk
+
+GARBAGE := .depend $(filter-out $(SRC_FILES),$(GARBAGE))
+
+$(addprefix bin/,part1 part2 part3): %:
+	$(OCAMLFIND) $(OCAMLOPT) $(OCAMLFLAGS) $(INCLUDES) $(LINKFLAGS) -o $@ $(LLVMOC) $(OCAMLOPTFLAGS) $^ $(LLVML)
 
 .SUFFIXES:
 
@@ -35,22 +59,13 @@ GARBAGE := $(filter-out $(SRC_FILES),$(ML_FILES) $(MLI_FILES) $(CMX_FILES) $(CMX
 %.ml: %.mll
 	$(OCAMLLEX) $<
 
-all : part1
-
-LLVMMODULES:=llvm_bitwriter llvm_executionengine llvm llvm_scalar_opts
-LLVMOC:=$(LLVMMODULES:%=%.cmxa)
-LLVML:=$(addprefix -cclib ,$(LLVMMODULES:%=-l%))
-
-part1 : $(CMX_FILES)
-	$(OCAMLFIND) $(OCAMLOPT) $(OCAMLFLAGS) $(INCLUDES) $(LINKFLAGS) -o p2 $(LLVMOC) $(OCAMLOPTFLAGS) $^ $(LLVML)
-
 clean ::
 	rm -f $(GARBAGE)
 
 .PRECIOUS: %/
-extern/ extern/tar/ extern/build/ : %/ :
+extern/ extern/tar/ extern/build/ bin/ : %/ :
 	mkdir -p $@
-extern/tar/ extern/build/ : extern/
+extern/tar/ extern/build/ : | extern/
 
 PREFIX:=$(shell pwd)/extern
 EXTERNALS:=$(addprefix extern/bin/,ocamlc ocamlfind llvm-as) $(patsubst %,extern/lib/ocaml/site-lib/%/META,monad extlib)
@@ -113,4 +128,4 @@ extern/lib/ocaml/site-lib/extlib/META : extern/build/extlib-1.5.1/Makefile | ext
 .depend: $(MLI_FILES) $(ML_FILES) | $(EXTERNALS) 
 	$(OCAMLFIND) $(OCAMLDEP) $(INCLUDES) $^ > .depend
 
-include .depend
+-include .depend
