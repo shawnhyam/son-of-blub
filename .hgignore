@@ -1,0 +1,6 @@
+syntax: glob
+extern
+bin
+part?/*.cm?
+part?/*.o
+.depend
