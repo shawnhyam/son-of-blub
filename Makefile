@@ -4,7 +4,7 @@ $(error Your version of make does not support the required features.)
 endif
 
 .PHONY: all
-all: $(addprefix bin/,part1 part2 part3)
+all: $(addprefix bin/,part1 part2 part3 part4)
 
 export PATH:=$(abspath extern/bin):$(PATH)
 OCAMLC=ocamlc 
@@ -29,6 +29,7 @@ get-mli-files=$(filter %.mli,$(patsubst %.mly,%.mli,$(1)))
 part1_SRC_FILES := part1/barebones_blub.ml
 part2_SRC_FILES := part2/son_of_blub.ml
 part3_SRC_FILES := part3/son_of_blub.ml
+part4_SRC_FILES := part4/son_of_blub.ml
 
 part:=part1
 include partN.mk
@@ -36,10 +37,12 @@ part:=part2
 include partN.mk
 part:=part3
 include partN.mk
+part:=part4
+include partN.mk
 
 GARBAGE := .depend $(filter-out $(SRC_FILES),$(GARBAGE))
 
-$(addprefix bin/,part1 part2 part3): %:
+$(addprefix bin/,part1 part2 part3 part4): %:
 	$(OCAMLFIND) $(OCAMLOPT) $(OCAMLFLAGS) $(INCLUDES) $(LINKFLAGS) -o $@ $(LLVMOC) $(OCAMLOPTFLAGS) $^ $(LLVML)
 
 .SUFFIXES:
