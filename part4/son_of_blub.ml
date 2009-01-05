@@ -63,6 +63,49 @@ and sclosure = {
 
 and sprimitive = L.lltype * L.llvalue  (* fn sig; code *)
 
+(* PRETTY PRINTING AND DEBUGGING *)
+
+
+let pp_var f (Variable v) = Format.fprintf f "@[%s@]" v
+
+let _pp_list ppe f = function
+    [] -> ()
+  | a1::an ->
+      let pprest f = List.iter (fun e -> Format.fprintf f "@ %a" ppe e) in
+      Format.fprintf f "%a%a" ppe a1 pprest an
+;;
+let pp_list ppe f = function
+    lst ->
+      Format.fprintf f "@[(%a)@]" (_pp_list ppe) lst 
+;;
+
+let pp_sllvm f (t, v) =
+  if (t = L.i1_type) && (GV.as_int v = 0) then Format.fprintf f "#f"
+  else if (t = L.i1_type) && (GV.as_int v = 1) then Format.fprintf f "#t"
+  else if (t = L.i64_type) then Format.fprintf f "%d" (GV.as_int v)
+;;
+
+let rec pp_ast f = function
+    Ast_lit l -> pp_sval f l
+  | Ast_ref r -> pp_var f r
+  | Ast_cnd (e1, e2, e3) -> 
+      Format.fprintf f "(if @[<hv>%a@ %a@ %a)@]" pp_ast e1 pp_ast e2 pp_ast e3
+  | Ast_app (fn, params) ->
+      Format.fprintf f "%a" (pp_list pp_ast) (fn :: (Array.to_list params))
+  | Ast_abs lam ->
+      Format.fprintf f "(fn @[<hv>%a@ %a)@]" (pp_list pp_var) (Array.to_list lam.lam_params) pp_ast lam.lam_ast
+  | Ast_define (v, ast) ->
+      Format.fprintf f "(define @[<hv>%a@ %a)@]" pp_var v pp_ast ast
+
+
+and pp_sval f = function
+    Sclosure { close_lam = lam } -> 
+      Format.fprintf f "@[(#closure @[<hv>args:%d@ ast:%a)@]@]" (Array.length lam.lam_params) pp_ast lam.lam_ast
+  | Sllvm (t, v) -> Format.fprintf f "%a" pp_sllvm (t, v)
+
+;;
+
+
 (* BASIC UTILITIES *)
 
 exception Found of (sval * binding)
@@ -201,7 +244,8 @@ let compile_fn ?fn globals (env:environment) (lambda:lambda) =
 (* INTERPRETER SECTION *)
 
 let eval (globals:global_environment) expr =
-  let rec eval env = function 
+  let rec eval env ast = 
+    let inner_eval env = function 
       Ast_lit lit -> lit
     | Ast_ref var -> begin
 	try
@@ -243,6 +287,10 @@ let eval (globals:global_environment) expr =
 	let _, sval = DynArray.get globals idx in
 	sval
       end
+    in
+    let sval = inner_eval env ast in
+    Format.printf "@[<hv 4>%a@ -->@ %a@]@." pp_ast ast pp_sval sval;
+    sval
 	
   and apply fn args =
     let prepare_llvm_args args =
@@ -319,17 +367,17 @@ let () =
 			      (mkapp (mkref "<") [mkref "n"; lit_int 3])
 			      (lit_int 1)
 			      (mkapp (mkref "+") 
-				 [mkapp (mkref "fib") 
+				 [mkapp (mkref "fibonacci") 
 				    [mkapp (mkref "-") [mkref "n"; lit_int 2]];
-				  mkapp (mkref "fib") 
+				  mkapp (mkref "fibonacci") 
 				    [mkapp (mkref "-") [mkref "n"; lit_int 1]]]))
     (Some (L.function_type L.i64_type [| L.i64_type |]))
   in
 
-  let bind_it = mkdef "fib" lambda in
+  let bind_it = mkdef "fibonacci" lambda in
   let _ = eval globals bind_it in
 
-  let expr = mkapp (mkref "fib") [lit_int 40] in
+  let expr = mkapp (mkref "fibonacci") [lit_int 40] in
 
   let result = eval globals expr in
   let () = match result with
