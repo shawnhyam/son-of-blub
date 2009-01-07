@@ -74,9 +74,14 @@ let _pp_list ppe f = function
       let pprest f = List.iter (fun e -> Format.fprintf f "@ %a" ppe e) in
       Format.fprintf f "%a%a" ppe a1 pprest an
 ;;
+
 let pp_list ppe f = function
     lst ->
       Format.fprintf f "@[(%a)@]" (_pp_list ppe) lst 
+;;
+
+let pp_pair pp1 pp2 f (v1,v2) =
+  Format.fprintf f "@[<hv 1>(%a@ %a)@]" pp1 v1 pp2 v2
 ;;
 
 let pp_sllvm f (t, v) =
@@ -99,10 +104,19 @@ let rec pp_ast f = function
 
 
 and pp_sval f = function
-    Sclosure { close_lam = lam } -> 
-      Format.fprintf f "@[(#closure @[<hv>args:%d@ ast:%a)@]@]" (Array.length lam.lam_params) pp_ast lam.lam_ast
+    Sclosure { close_lam = lam; close_env = env } -> 
+      Format.fprintf f "@[@,<#closure @[<hv>args:%a@ ast:%a@ env:%a>@]@]" (pp_list pp_var) (Array.to_list lam.lam_params) pp_ast lam.lam_ast pp_env env
   | Sllvm (t, v) -> Format.fprintf f "%a" pp_sllvm (t, v)
 
+and pp_frame f frame =
+  let lst = Array.to_list (Array.mapi (fun idx var -> (var, frame.frame_vals.(idx)))
+                             frame.frame_vars)
+  in
+  Format.fprintf f "@[{#frame @[<hv>%a}@]@]" 
+    (pp_list (pp_pair pp_var pp_sval)) lst
+
+and pp_env f env =
+  Format.fprintf f "@[{#env @[<hv>%a}@]@]" (pp_list pp_frame) env
 ;;
 
 
